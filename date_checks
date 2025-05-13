@@ -1,0 +1,27 @@
+# Code Block 2
+import requests, json, pandas_datareader as pdr
+
+def min_year(series_id):
+    """Get earliest year for BLS series using binary search"""
+    # Try BLS API
+    url = 'https://api.bls.gov/publicAPI/v2/timeseries/data/'
+    lo, hi, found = 1900, 2025, None
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        print(f"Checking {mid}...")
+        payload = {"seriesid": [series_id], "startyear": str(mid), "endyear": str(mid)}
+        r = requests.post(url, json=payload, headers={'Content-type': 'application/json'})
+
+        if r.status_code == 200:
+            data = r.json()
+            if data['status'] == 'REQUEST_SUCCEEDED' and data['Results']['series'][0]['data']:
+                found, hi = mid, mid - 1  # Found data, look earlier
+            else:
+                lo = mid + 1  # No data, look later
+
+    return found
+
+# Get earliest year for series update series_id here too
+earliest = min_year('WPUSI012011')
+print(f"Earliest year: {earliest}")
