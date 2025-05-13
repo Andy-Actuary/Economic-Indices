@@ -1,0 +1,217 @@
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import os
+from scipy import stats
+from openpyxl import Workbook
+from openpyxl.drawing.image import Image
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Font, Alignment, PatternFill
+from datetime import datetime
+
+def analyze_construction_materials_ppi(df, save_filename="PPI_Construction_Materials_Analysis.xlsx"):
+    """
+    Comprehensive analysis of PPI Construction Materials data with multiple timeframe linear fits,
+    visualization, and Excel export with detailed statistics.
+    
+    Parameters:
+    - df: DataFrame with 'date' and 'value' columns
+    - save_filename: Name of the Excel file to save results
+    """
+    # Ensure date column is datetime
+    df['date'] = pd.to_datetime(df['date'])
+    
+    # Sort data by date
+    df = df.sort_values('date')
+    
+    # Filter data for the last 20+ years (or all data if less than 20 years available)
+    latest_date = df['date'].max()
+    cutoff_date = latest_date - pd.DateOffset(years=20)
+    df_analysis = df[df['date'] >= cutoff_date].copy()
+    
+    # Create the base plot
+    plt.figure(figsize=(14, 8))
+    plt.plot(df_analysis['date'], df_analysis['value'], 'b-', linewidth=1.5, label='PPI Construction Materials')
+    
+    # Function to add linear fit line and calculate comprehensive statistics
+    def add_linear_fit(data, years, label, color):
+        # Filter for the specific time period
+        end_date = data['date'].max()
+        start_date = end_date - pd.DateOffset(years=years)
+        period_data = data[data['date'] >= start_date].copy()
+        
+        # Get first and last dates and values (actual data points)
+        first_date = period_data['date'].min()
+        last_date = period_data['date'].max()
+        first_value = period_data.loc[period_data['date'] == first_date, 'value'].values[0]
+        last_value = period_data.loc[period_data['date'] == last_date, 'value'].values[0]
+        
+        # Convert dates to numerical values for regression
+        period_data['days'] = (period_data['date'] - first_date).dt.total_seconds() / (24*3600)
+        x = period_data['days']
+        y = period_data['value']
+        
+        # Perform linear regression
+        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+        
+        # Calculate predicted values for plotting
+        period_data['predicted'] = intercept + slope * x
+        
+        # Calculate statistics
+        total_change = last_value - first_value
+        total_change_pct = (total_change / first_value) * 100
+        
+        # Calculate annual changes
+        annual_change = slope * 365.25  # Slope in units per day * days per year
+        annual_change_pct = (annual_change / first_value) * 100  # Annualized linear rate
+        
+        # Calculate CAGR
+        years_elapsed = (last_date - first_date).days / 365.25
+        cagr = (last_value / first_value) ** (1 / years_elapsed) - 1
+        cagr_pct = cagr * 100
+        
+        # Plot the linear fit line
+        fit_label = f"{years}-year Fit ({annual_change_pct:.2f}% linear, {cagr_pct:.2f}% CAGR)"
+        plt.plot(period_data['date'], period_data['predicted'], linestyle='--', color=color, 
+                 linewidth=2, label=fit_label)
+        
+        # Return comprehensive statistics
+        return {
+            'period': f"{first_date.strftime('%m/%d/%Y')} to {last_date.strftime('%m/%d/%Y')}",
+            'years': years,
+            'years_elapsed': years_elapsed,
+            'data_points': len(period_data),
+            'first_date': first_date,
+            'last_date': last_date,
+            'first_value': first_value,
+            'last_value': last_value,
+            'total_change': total_change,
+            'total_change_pct': total_change_pct,
+            'annual_change': annual_change,
+            'annual_change_pct': annual_change_pct,
+            'cagr': cagr_pct,
+            'r_squared': r_value**2,
+            'slope': slope,
+            'intercept': intercept,
+            'daily_change': slope,
+            'monthly_change': slope * 30.44,
+            'p_value': p_value,
+            'std_err': std_err
+        }
+
+    # Add linear fits for different time periods with distinct colors
+    colors = ['red', 'green', 'orange', 'purple', 'brown']
+    time_periods = [20, 10, 5, 3, 1]
+    results = {}
+    
+    for i, years in enumerate(time_periods):
+        if i < len(colors):
+            result = add_linear_fit(df_analysis, years, f"{years}-year", colors[i])
+            results[f"{years}-year"] = result
+    
+    # Customize the plot
+    plt.xlabel('Date', fontsize=12)
+    plt.ylabel('PPI Value', fontsize=12)
+    plt.title('PPI Construction Materials with Linear Trend Analysis', fontsize=16)
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='upper left', fontsize=10)
+    
+    # Format x-axis with years
+    plt.gca().xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter('%Y'))
+    plt.gca().xaxis.set_major_locator(plt.matplotlib.dates.YearLocator(2))  # Show every 2 years
+    plt.xticks(rotation=45)
+    
+    # Add text box with key comparisons
+    text_box = (
+        f"Trend Comparison:\n"
+        f"20-year CAGR: {results['20-year']['cagr']:.2f}% vs Linear: {results['20-year']['annual_change_pct']:.2f}%\n"
+        f"10-year CAGR: {results['10-year']['cagr']:.2f}% vs Linear: {results['10-year']['annual_change_pct']:.2f}%\n"
+        f"5-year CAGR: {results['5-year']['cagr']:.2f}% vs Linear: {results['5-year']['annual_change_pct']:.2f}%\n"
+        f"3-year CAGR: {results['3-year']['cagr']:.2f}% vs Linear: {results['3-year']['annual_change_pct']:.2f}%\n"
+        f"1-year CAGR: {results['1-year']['cagr']:.2f}% vs Linear: {results['1-year']['annual_change_pct']:.2f}%"
+    )
+    
+    plt.annotate(text_box, xy=(0.02, 0.02), xycoords='figure fraction', 
+                 bbox=dict(boxstyle="round,pad=0.5", facecolor='white', alpha=0.8),
+                 fontsize=9, verticalalignment='bottom')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    plot_filename = 'ppi_construction_trends.png'
+    plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+    
+    # Create Excel workbook
+    wb = Workbook()
+    
+    # Add the data to the "data" sheet
+    ws_data = wb.active
+    ws_data.title = "data"
+    
+    for r in dataframe_to_rows(df, index=False, header=True):
+        ws_data.append(r)
+    
+    # Format the data sheet
+    for cell in ws_data[1]:  # Format header row
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
+        cell.fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+    
+    # Create the "trend analysis" sheet
+    ws_analysis = wb.create_sheet(title="trend analysis")
+    
+    # Add analysis results
+    headers = ["Metric", "20-Year", "10-Year", "5-Year", "3-Year", "1-Year"]
+    ws_analysis.append(headers)
+    
+    # Format headers
+    for cell in ws_analysis[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
+        cell.fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
+    
+    # Define metrics to include
+    metrics = [
+        ("Period", lambda x: x['period']),
+        ("Data Points", lambda x: x['data_points']),
+        ("Initial Value", lambda x: f"{x['first_value']:.2f}"),
+        ("Final Value", lambda x: f"{x['last_value']:.2f}"),
+        ("Total Change", lambda x: f"{x['total_change']:.2f}"),
+        ("Total Change %", lambda x: f"{x['total_change_pct']:.2f}%"),
+        ("Annual Change (units/year)", lambda x: f"{x['annual_change']:.4f}"),
+        ("Annualized Linear Rate", lambda x: f"{x['annual_change_pct']:.2f}%"),
+        ("CAGR", lambda x: f"{x['cagr']:.2f}%"),
+        ("R-squared", lambda x: f"{x['r_squared']:.4f}"),
+        ("Linear Equation", lambda x: f"y = {x['slope']:.6f} * days + {x['intercept']:.4f}")
+    ]
+    
+    # Add each metric row
+    for metric_name, metric_func in metrics:
+        row = [metric_name]
+        for years in time_periods:
+            period_key = f"{years}-year"
+            row.append(metric_func(results[period_key]))
+        ws_analysis.append(row)
+    
+    # Add the plot to the "visualization" sheet
+    ws_graph = wb.create_sheet(title="visualization")
+    img = Image(plot_filename)
+    
+    # Add the image to cell A1
+    ws_graph.add_image(img, 'A1')
+    
+    # Save the workbook
+    wb.save(save_filename)
+    print(f"Analysis completed and saved to {save_filename}")
+    
+    # Show the plot
+    plt.show()
+    
+    # Delete temporary image file
+    if os.path.exists(plot_filename):
+        os.remove(plot_filename)
+    
+    return results
+
+# Sample usage:
+# results = analyze_construction_materials_ppi(df, "PPI_Construction_Materials_Analysis.xlsx")
