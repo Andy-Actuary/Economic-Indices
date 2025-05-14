@@ -1,0 +1,592 @@
+import pandas as pd
+import pandas_datareader.data as web
+import numpy as np
+from datetime import datetime
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from IPython.display import display
+from tabulate import tabulate
+from scipy import stats
+import io
+import os
+
+# Try to import openpyxl, and if it's not available, provide instructions
+try:
+    import openpyxl
+    from openpyxl.drawing.image import Image
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+    print("openpyxl is not installed. To install it, run: pip install openpyxl")
+    print("For now, I'll save separate CSV files and the chart image.")
+
+def analyze_fred_series(series_id='CIU2010000000230I', var_name='eci_midwest', start_year=1900):
+    """
+    Analyze a FRED time series with comprehensive exponential trend analysis and visualization.
+    
+    Parameters:
+    -----------
+    series_id : str
+        The FRED series ID to analyze
+    var_name : str
+        The name to use for the variable in output files and displays
+    start_year : int
+        The starting year for data retrieval
+    """
+    # Get data from FRED
+    print(f"Retrieving {var_name} (Series: {series_id}) from FRED...")
+    data = web.DataReader(series_id, 'fred', start=datetime(start_year, 1, 1))
+    
+    # Rename the column to the provided variable name
+    data.columns = [var_name]
+    
+    # Determine frequency
+    data_freq = determine_frequency(data)
+    print(f"Detected frequency: {data_freq}")
+    
+    # Perform trend analysis
+    trend_periods = [20, 15, 10, 5, 3, 2, 1]
+    trend_results = perform_exponential_trend_analysis(data, var_name, trend_periods, data_freq)
+    
+    # Display trend analysis table
+    display_trend_table(trend_results)
+    
+    # Create visualization with trend lines
+    chart_img_paths = create_trend_charts(data, var_name, trend_results, data_freq)
+    
+    # Create the Excel workbook with all outputs
+    create_excel_file_with_image(data, trend_results, chart_img_paths, var_name)
+    
+    # Return the data and analysis results
+    return data, trend_results
+
+def determine_frequency(data):
+    """Determine the frequency of the time series data"""
+    # Get the unique months in the data
+    if len(data) < 2:
+        return "insufficient data"
+    
+    # Check the difference between dates
+    date_diffs = pd.Series(data.index[1:]) - pd.Series(data.index[:-1])
+    median_days = date_diffs.median().days
+    
+    if median_days <= 45:  # Approximately monthly
+        return "monthly"
+    elif median_days <= 100:  # Approximately quarterly
+        return "quarterly"
+    else:  # Assume annual
+        return "annual"
+
+def perform_exponential_trend_analysis(data, var_name, periods, frequency):
+    """Perform exponential trend analysis for specified periods"""
+    current_year = datetime.now().year
+    results = []
+    
+    # Define period multipliers based on frequency
+    if frequency == "monthly":
+        period_mult = 12
+    elif frequency == "quarterly":
+        period_mult = 4
+    else:  # annual
+        period_mult = 1
+    
+    for period in periods:
+        # Skip if we don't have enough data
+        if len(data) < period * period_mult:
+            results.append({
+                'period': period,
+                'annual_growth_rate': np.nan,
+                'r_squared': np.nan,
+                'start_value': np.nan,
+                'end_value': np.nan,
+                'start_date': None,
+                'end_date': None,
+                'trend_line': None
+            })
+            continue
+        
+        # Get data for the period
+        period_data = data[data.index >= pd.Timestamp(current_year - period, 1, 1)].copy()
+        
+        if len(period_data) == 0 or period_data[var_name].isna().all():
+            results.append({
+                'period': period,
+                'annual_growth_rate': np.nan,
+                'r_squared': np.nan,
+                'start_value': np.nan,
+                'end_value': np.nan,
+                'start_date': None,
+                'end_date': None,
+                'trend_line': None
+            })
+            continue
+        
+        # Record start and end values
+        start_value = period_data[var_name].dropna().iloc[0]
+        end_value = period_data[var_name].dropna().iloc[-1]
+        start_date = period_data.index[0]
+        end_date = period_data.index[-1]
+        
+        # Prepare for exponential regression
+        period_data = period_data.dropna(subset=[var_name])
+        
+        # Skip if we don't have positive values (required for log transform)
+        if not all(period_data[var_name] > 0):
+            results.append({
+                'period': period,
+                'annual_growth_rate': np.nan,
+                'r_squared': np.nan,
+                'start_value': start_value,
+                'end_value': end_value,
+                'start_date': start_date,
+                'end_date': end_date,
+                'trend_line': None
+            })
+            continue
+            
+        # Convert dates to numerical values for regression
+        period_data['date_num'] = mdates.date2num(period_data.index)
+        period_data['time_idx'] = (period_data['date_num'] - period_data['date_num'].min()) / 365.25  # Convert to years
+        
+        # Perform log-linear regression
+        y = np.log(period_data[var_name])
+        X = period_data['time_idx']
+        
+        # Add constant for statsmodels
+        X_const = np.column_stack((np.ones(len(X)), X))
+        
+        # Perform regression
+        try:
+            # Use scipy stats for simplicity
+            slope, intercept, r_value, p_value, std_err = stats.linregress(X, y)
+            
+            # Calculate annual growth rate
+            annual_growth_rate = np.exp(slope) - 1  # Convert to annual rate
+            r_squared = r_value**2
+            
+            # Generate trend line points for the entire period
+            time_range = np.linspace(0, period_data['time_idx'].max(), 100)
+            trend_values = np.exp(intercept + slope * time_range)
+            
+            # Calculate dates for the trend line
+            min_date_num = period_data['date_num'].min()
+            trend_dates = []
+            
+            for t in time_range:
+                # Convert from date number to datetime (will be timezone-naive)
+                date = mdates.num2date(min_date_num + t * 365.25)
+                # Make timezone naive by replacing with its local time
+                naive_date = date.replace(tzinfo=None)
+                trend_dates.append(naive_date)
+            
+            trend_line = {
+                'dates': trend_dates,
+                'values': trend_values,
+                'equation': f"y = {np.exp(intercept):.2f} * e^({slope:.4f} * t)",
+                'intercept': intercept,
+                'slope': slope
+            }
+            
+            results.append({
+                'period': period,
+                'annual_growth_rate': annual_growth_rate,
+                'r_squared': r_squared,
+                'start_value': start_value,
+                'end_value': end_value,
+                'start_date': start_date,
+                'end_date': end_date,
+                'trend_line': trend_line
+            })
+        except Exception as e:
+            print(f"Error in regression for period {period}: {str(e)}")
+            results.append({
+                'period': period,
+                'annual_growth_rate': np.nan,
+                'r_squared': np.nan,
+                'start_value': start_value,
+                'end_value': end_value,
+                'start_date': start_date,
+                'end_date': end_date,
+                'trend_line': None
+            })
+    
+    return results
+
+def display_trend_table(trend_results):
+    """Display exponential trend analysis results in a formatted table"""
+    table_data = []
+    headers = ["Period (Years)", "Annual Growth Rate", "R-Squared", "Start Value", "End Value", "Start Date", "End Date"]
+    
+    for result in trend_results:
+        if pd.isna(result['annual_growth_rate']):
+            growth_rate_str = "N/A"
+        else:
+            growth_rate_str = f"{result['annual_growth_rate']*100:.2f}%"
+            
+        if pd.isna(result['r_squared']):
+            r_squared_str = "N/A"
+        else:
+            r_squared_str = f"{result['r_squared']:.4f}"
+            
+        row = [
+            result['period'],
+            growth_rate_str,
+            r_squared_str,
+            f"{result['start_value']:.2f}" if not pd.isna(result['start_value']) else "N/A",
+            f"{result['end_value']:.2f}" if not pd.isna(result['end_value']) else "N/A",
+            result['start_date'].strftime('%Y-%m-%d') if result['start_date'] else "N/A",
+            result['end_date'].strftime('%Y-%m-%d') if result['end_date'] else "N/A"
+        ]
+        table_data.append(row)
+    
+    print("\nExponential Regression (Log-Linear) Analysis Results:")
+    print(tabulate(table_data, headers=headers, tablefmt="grid"))
+
+def create_trend_charts(data, var_name, trend_results, frequency):
+    """Create charts for the data and exponential trend analysis"""
+    # Create figure with subplots for the full dataset
+    fig1, axs1 = plt.subplots(2, 1, figsize=(14, 12), gridspec_kw={'height_ratios': [2, 1]})
+    
+    # Plot 1.1: Main data with trend lines (full dataset)
+    axs1[0].plot(data.index, data[var_name], label=var_name.replace('_', ' ').title(), linewidth=2)
+    
+    # Add trend lines for different periods
+    colors = plt.cm.tab10.colors  # Use a color cycle
+    
+    # Plot trend lines for all periods with valid trends
+    for i, result in enumerate(trend_results):
+        if result['trend_line'] is not None:
+            # Get the trend line data
+            trend_line = result['trend_line']
+            trend_dates = trend_line['dates']
+            trend_values = trend_line['values']
+            
+            # Format growth rate
+            growth_rate = result['annual_growth_rate'] * 100
+            growth_rate_str = f"{growth_rate:.2f}%" if not pd.isna(growth_rate) else "N/A"
+            
+            # Plot the trend line
+            color_idx = i % len(colors)
+            axs1[0].plot(trend_dates, trend_values, '--', 
+                       color=colors[color_idx],
+                       label=f"{result['period']}-Year Trend: {growth_rate_str}/yr (r²={result['r_squared']:.2f})", 
+                       linewidth=1.5)
+    
+    # Format date axis
+    axs1[0].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    axs1[0].xaxis.set_major_locator(mdates.YearLocator(base=5))
+    
+    axs1[0].set_title(f"{var_name.replace('_', ' ').title()} with Exponential Trend Lines", fontsize=14)
+    axs1[0].legend(loc='upper left')
+    axs1[0].grid(True, alpha=0.3)
+    
+    # Plot 1.2: Annual Growth Rates from Exponential Regression
+    periods = [result['period'] for result in trend_results]
+    growth_rates = [result['annual_growth_rate'] * 100 if not pd.isna(result['annual_growth_rate']) else 0 
+                   for result in trend_results]
+    r_squared_values = [result['r_squared'] if not pd.isna(result['r_squared']) else 0 
+                       for result in trend_results]
+    
+    # Create positions for bars
+    x = np.arange(len(periods))
+    width = 0.5
+    
+    # Plot Annual Growth Rate bars
+    bars = axs1[1].bar(x, growth_rates, width, label='Annual Growth Rate (%)')
+    
+    # Determine y-axis range for better visibility
+    max_growth = max([g for g in growth_rates if g > 0], default=5)
+    min_growth = min([g for g in growth_rates if g < 0], default=-5)
+    
+    y_max = max(5, max_growth * 1.3)  # At least 5% or 30% higher than max value
+    y_min = min(-2, min_growth * 1.3)  # At least -2% or 30% lower than min value
+    
+    # Set y-axis limits
+    axs1[1].set_ylim(y_min, y_max)
+    
+    # Color bars by R-squared value
+    for i, (bar, r2, rate) in enumerate(zip(bars, r_squared_values, growth_rates)):
+        if r2 > 0:  # Only color if we have valid data
+            # Scale from light to dark color based on R-squared
+            alpha = max(0.3, min(1.0, r2))  # Between 0.3 and 1.0
+            bar.set_alpha(alpha)
+            
+            # Add growth rate value on the bar
+            axs1[1].text(i, rate + (y_max * 0.03), f"{rate:.2f}%", 
+                       ha='center', fontsize=10)
+            
+            # Add R-squared below period label
+            axs1[1].text(i, y_min * 0.8, f"r²: {r2:.2f}", ha='center', fontsize=8)
+    
+    # Set labels and title
+    axs1[1].set_xlabel('Analysis Period (Years)', fontsize=12)
+    axs1[1].set_ylabel('Annual Growth Rate (%)', fontsize=12)
+    axs1[1].set_title('Annual Growth Rates from Exponential Regression', fontsize=14)
+    
+    # Set x-ticks to period values
+    axs1[1].set_xticks(x)
+    axs1[1].set_xticklabels(periods)
+    
+    # Add horizontal line at y=0
+    axs1[1].axhline(y=0, color='black', linestyle='-', alpha=0.3)
+    
+    axs1[1].grid(True, alpha=0.3, axis='y')
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save the chart to a file
+    chart_path1 = f'{var_name}_full_analysis.png'
+    plt.savefig(chart_path1, dpi=300, bbox_inches='tight')
+    print(f"Full analysis chart saved to {chart_path1}")
+    
+    # Close the first figure to free memory
+    plt.close(fig1)
+    
+    # =====================================================================
+    # NOW CREATE THE SECOND CHART - RECENT 10 YEARS WITH SELECTED TRENDS
+    # =====================================================================
+    
+    # Create a new figure for the recent 10 years
+    fig2 = plt.figure(figsize=(14, 8))
+    ax2 = fig2.add_subplot(111)
+    
+    # Get data for the most recent 10 years
+    current_year = datetime.now().year
+    recent_cutoff = pd.Timestamp(current_year - 10, 1, 1)
+    recent_data = data[data.index >= recent_cutoff].copy()
+    
+    # Plot the main data for recent 10 years
+    ax2.plot(recent_data.index, recent_data[var_name], label=var_name.replace('_', ' ').title(), linewidth=2.5)
+    
+    # Selected periods for the recent chart (1, 2, 3, 5, 10 years)
+    selected_periods = [1, 2, 3, 5, 10]
+    
+    # Plot only selected trend lines
+    for i, result in enumerate(trend_results):
+        if result['period'] in selected_periods and result['trend_line'] is not None:
+            # Get the trend line data
+            trend_line = result['trend_line']
+            trend_dates = trend_line['dates']
+            trend_values = trend_line['values']
+            
+            # Filter to only show the trend line for the recent period
+            recent_mask = []
+            for date in trend_dates:
+                # Ensure dates are comparable (both naive or both aware)
+                if hasattr(date, 'tzinfo') and date.tzinfo is not None:
+                    date = date.replace(tzinfo=None)  # Make naive
+                
+                # Compare with recent_cutoff
+                if date >= recent_cutoff:
+                    recent_mask.append(True)
+                else:
+                    recent_mask.append(False)
+            
+            # Create filtered lists
+            recent_dates = [d for d, include in zip(trend_dates, recent_mask) if include]
+            recent_values = [v for v, include in zip(trend_values, recent_mask) if include]
+            
+            # Format growth rate
+            growth_rate = result['annual_growth_rate'] * 100
+            growth_rate_str = f"{growth_rate:.2f}%" if not pd.isna(growth_rate) else "N/A"
+            
+            # Plot the trend line with thicker lines for the recent chart
+            color_idx = selected_periods.index(result['period']) % len(colors)
+            ax2.plot(recent_dates, recent_values, '--', 
+                    color=colors[color_idx],
+                    label=f"{result['period']}-Year Trend: {growth_rate_str}/yr (r²={result['r_squared']:.2f})", 
+                    linewidth=2.0)
+    
+    # Format date axis for recent chart
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax2.xaxis.set_major_locator(mdates.YearLocator(base=1))  # Show every year
+    plt.xticks(rotation=45)  # Rotate year labels
+    
+    # Set title and labels
+    ax2.set_title(f"Recent 10 Years: {var_name.replace('_', ' ').title()} with Selected Trend Lines", fontsize=16)
+    ax2.legend(loc='best', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    
+    # Add y-axis label
+    ax2.set_ylabel(var_name.replace('_', ' ').title(), fontsize=14)
+    
+    # Adjust layout
+    plt.tight_layout()
+    
+    # Save the recent chart to a file
+    chart_path2 = f'{var_name}_recent_10yr_analysis.png'
+    plt.savefig(chart_path2, dpi=300, bbox_inches='tight')
+    print(f"Recent 10-year analysis chart saved to {chart_path2}")
+    
+    # Close the second figure to free memory
+    plt.close(fig2)
+    
+    return [chart_path1, chart_path2]
+
+def create_excel_file_with_image(data, trend_results, chart_img_paths, var_name):
+    """Create a comprehensive Excel file with all analysis outputs including the chart images"""
+    excel_filename = f'{var_name}_analysis.xlsx'
+    
+    if not HAS_OPENPYXL:
+        # Fall back to saving CSV files if openpyxl is not available
+        data.to_csv(f'{var_name}_data.csv')
+        
+        # Create a trend analysis CSV
+        trend_df = pd.DataFrame({
+            'Period (Years)': [r['period'] for r in trend_results],
+            'Annual Growth Rate': [r['annual_growth_rate'] if not pd.isna(r['annual_growth_rate']) else None for r in trend_results],
+            'R-Squared': [r['r_squared'] if not pd.isna(r['r_squared']) else None for r in trend_results],
+            'Start Value': [r['start_value'] if not pd.isna(r['start_value']) else None for r in trend_results],
+            'End Value': [r['end_value'] if not pd.isna(r['end_value']) else None for r in trend_results],
+            'Start Date': [r['start_date'].strftime('%Y-%m-%d') if r['start_date'] else None for r in trend_results],
+            'End Date': [r['end_date'].strftime('%Y-%m-%d') if r['end_date'] else None for r in trend_results],
+            'Equation': [r['trend_line']['equation'] if r['trend_line'] else None for r in trend_results]
+        })
+        trend_df.to_csv(f'{var_name}_trend_analysis.csv', index=False)
+        
+        print(f"Data saved to {var_name}_data.csv")
+        print(f"Trend analysis saved to {var_name}_trend_analysis.csv")
+        print(f"Charts saved to {chart_img_paths}")
+        print("\nTo install openpyxl and create a combined Excel file, run: pip install openpyxl")
+        return
+    
+    try:
+        # First, create a workbook and sheets
+        workbook = openpyxl.Workbook()
+        
+        # Remove the default sheet and create our sheets
+        default_sheet = workbook.active
+        workbook.remove(default_sheet)
+        
+        # Create raw data sheet
+        data_sheet = workbook.create_sheet("Raw Data")
+        
+        # Write headers for raw data
+        data_sheet['A1'] = 'Date'
+        data_sheet['B1'] = var_name
+        
+        # Write raw data
+        for i, (date, value) in enumerate(zip(data.index, data[var_name]), start=2):
+            data_sheet[f'A{i}'] = date
+            data_sheet[f'B{i}'] = value
+        
+        # Create trend analysis sheet
+        trend_sheet = workbook.create_sheet("Trend Analysis")
+        
+        # Write headers for trend analysis
+        headers = ["Period (Years)", "Annual Growth Rate", "R-Squared", "Start Value", 
+                   "End Value", "Start Date", "End Date", "Equation"]
+        for col, header in enumerate(headers, start=1):
+            trend_sheet.cell(row=1, column=col, value=header)
+        
+        # Write trend analysis data
+        for row, result in enumerate(trend_results, start=2):
+            trend_sheet.cell(row=row, column=1, value=result['period'])
+            
+            if not pd.isna(result['annual_growth_rate']):
+                cell = trend_sheet.cell(row=row, column=2, value=result['annual_growth_rate'])
+                cell.number_format = '0.00%'
+            
+            if not pd.isna(result['r_squared']):
+                trend_sheet.cell(row=row, column=3, value=result['r_squared'])
+            
+            if not pd.isna(result['start_value']):
+                trend_sheet.cell(row=row, column=4, value=result['start_value'])
+            
+            if not pd.isna(result['end_value']):
+                trend_sheet.cell(row=row, column=5, value=result['end_value'])
+            
+            if result['start_date']:
+                trend_sheet.cell(row=row, column=6, value=result['start_date'])
+            
+            if result['end_date']:
+                trend_sheet.cell(row=row, column=7, value=result['end_date'])
+            
+            if result['trend_line']:
+                trend_sheet.cell(row=row, column=8, value=result['trend_line']['equation'])
+        
+        # Create charts sheet and add the images
+        chart_sheet = workbook.create_sheet("Charts")
+        
+        # Add the full analysis chart image
+        try:
+            # Get absolute path to the image
+            abs_img_path1 = os.path.abspath(chart_img_paths[0])
+            
+            # Create an image object
+            img1 = Image(abs_img_path1)
+            
+            # You can resize the image if needed (adjusted for Excel)
+            img1.width = 800  # in pixels
+            img1.height = 600  # in pixels
+            
+            # Add title for the full analysis chart
+            chart_sheet['A1'] = "Full Time Series Analysis"
+            
+            # Add to the sheet (at row 2 to leave room for the title)
+            chart_sheet.add_image(img1, 'A2')
+            
+            # Add some spacing
+            # We'll add the second chart further down
+            
+            # Add title for recent analysis chart
+            chart_sheet['A30'] = "Recent 10-Year Analysis"
+            
+            # Add the recent 10-year chart image
+            if len(chart_img_paths) > 1:
+                abs_img_path2 = os.path.abspath(chart_img_paths[1])
+                img2 = Image(abs_img_path2)
+                img2.width = 800  # in pixels
+                img2.height = 400  # in pixels
+                chart_sheet.add_image(img2, 'A31')
+            
+            print(f"Successfully added chart images to the Excel file.")
+        except Exception as e:
+            print(f"Error adding images to Excel: {str(e)}")
+            chart_sheet['A1'] = f"Chart images could not be embedded directly. Please see: {chart_img_paths}"
+        
+        # Set column widths for better readability
+        for column in ['A', 'B']:
+            data_sheet.column_dimensions[column].width = 20
+        
+        for i, column in enumerate(['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']):
+            width = 30 if i > 0 else 15  # Make first column narrower
+            trend_sheet.column_dimensions[column].width = width
+        
+        # Save the workbook
+        workbook.save(excel_filename)
+        print(f"Excel workbook with embedded charts created: {excel_filename}")
+    
+    except Exception as e:
+        print(f"Error creating Excel file with images: {str(e)}")
+        print("Falling back to saving separate files...")
+        
+        # Fall back to saving CSV files
+        data.to_csv(f'{var_name}_data.csv')
+        
+        # Create a trend analysis CSV
+        trend_df = pd.DataFrame({
+            'Period (Years)': [r['period'] for r in trend_results],
+            'Annual Growth Rate': [r['annual_growth_rate'] if not pd.isna(r['annual_growth_rate']) else None for r in trend_results],
+            'R-Squared': [r['r_squared'] if not pd.isna(r['r_squared']) else None for r in trend_results],
+            'Start Value': [r['start_value'] if not pd.isna(r['start_value']) else None for r in trend_results],
+            'End Value': [r['end_value'] if not pd.isna(r['end_value']) else None for r in trend_results],
+            'Start Date': [r['start_date'].strftime('%Y-%m-%d') if r['start_date'] else None for r in trend_results],
+            'End Date': [r['end_date'].strftime('%Y-%m-%d') if r['end_date'] else None for r in trend_results],
+            'Equation': [r['trend_line']['equation'] if r['trend_line'] else None for r in trend_results]
+        })
+        trend_df.to_csv(f'{var_name}_trend_analysis.csv', index=False)
+        
+        print(f"Data saved to {var_name}_data.csv")
+        print(f"Trend analysis saved to {var_name}_trend_analysis.csv")
+        print(f"Charts saved to {chart_img_paths}")
+
+# Example usage
+if __name__ == "__main__":
+    # Default usage with the original series
+    eci_data, trend_results = analyze_fred_series()
+    
+    # To analyze a different series, provide series_id and var_name
+    # Example: Unemployment Rate
+    # unemployment_data, unemployment_trends = analyze_fred_series('UNRATE', 'unemployment_rate')
