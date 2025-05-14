@@ -1,0 +1,36 @@
+#6a161814abd30ba8791f3926eb1e44ee 
+!pip install fredapi
+import pandas as pd
+from fredapi import Fred
+from datetime import datetime
+from IPython.display import display
+
+# Your FRED API key
+api_key = "6a161814abd30ba8791f3926eb1e44ee"  # Replace with your actual API key
+
+# Initialize the Fred object with your API key
+fred = Fred(api_key=api_key)
+
+# Get the series data
+series_id = 'CIU2010000000230I'
+eci_midwest = fred.get_series(series_id, start=datetime(1900, 1, 1))
+
+# Export the data to a text file (CSV format)
+output_filename = 'eci_midwest_data.csv'
+eci_midwest.to_csv(output_filename)
+
+print(f"Data exported to {output_filename}")
+
+# Display the data in the notebook
+display(eci_midwest)
+
+# Get series information
+series_info = fred.get_series_info(series_id)
+print("\n=== Series Metadata ===")
+for key, value in series_info.items():
+    print(f"{key}: {value}")
+
+# Search for related series
+related_series = fred.search(f'"{series_info["title"]}"', limit=5)
+print("\n=== Related Series ===")
+display(related_series)
